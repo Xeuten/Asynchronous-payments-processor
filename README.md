@@ -31,6 +31,47 @@
           exchange "payments.dlx" ──payments.new──► queue "payments.new.dlq"
 ```
 
+### Соединения между контейнерами
+
+Все сервисы находятся в одной сети Docker Compose и обращаются друг к другу по именам сервисов (`postgres`, `rabbitmq`, `webhook-mock`). Порты из секции `ports:` нужны только для доступа с хоста.
+
+```
+ хост (ваш компьютер)
+   │ ① HTTP  localhost:8000 ──(проброс порта)──┐
+   │                                            ▼
+   │                                   ┌──────────────┐ ② TCP 5432 (протокол PostgreSQL)
+   │                                   │     api      │───────────────────────┐
+   │                                   │ uvicorn +    │ ③ TCP 5672 (AMQP)     │
+   │                                   │ outbox relay │──────────┐            │
+   │                                   └──────────────┘          ▼            ▼
+   │                                                      ┌──────────┐  ┌──────────┐
+   │                                                      │ rabbitmq │  │ postgres │
+   │                                                      └──────────┘  └──────────┘
+   │                                                           ▲ ④ AMQP     ▲ ⑤ TCP 5432
+   │                                                           │            │
+   │                                                      ┌──────────────────┐
+   │                                                      │    consumer      │
+   │                                                      └──────────────────┘
+   │                                                           │ ⑥ HTTP webhook-mock:9000
+   │                                                           ▼
+   │                                                      ┌──────────────┐
+   └── localhost:9000 (только чтобы смотреть /received) ─►│ webhook-mock │
+                                                          └──────────────┘
+```
+
+| № | Откуда → куда | Протокол / порт | Для чего |
+|---|---|---|---|
+| ① | хост → `api` | HTTP, `localhost:8000` | запросы клиента к API |
+| ② | `api` → `postgres` | PostgreSQL, 5432 | запись платежей и outbox, чтение outbox relay'ем |
+| ③ | `api` → `rabbitmq` | AMQP, 5672 | публикация событий из outbox (с publisher confirms) |
+| ④ | `consumer` ↔ `rabbitmq` | AMQP, 5672 | получение сообщений из `payments.new`, ack / nack |
+| ⑤ | `consumer` → `postgres` | PostgreSQL, 5432 | чтение платежа и обновление статуса |
+| ⑥ | `consumer` → `webhook-mock` | HTTP, 9000 | отправка webhook (или во внешний интернет, если `webhook_url` внешний) |
+
+- TCP-соединения открывают только клиенты (`api`, `consumer`). RabbitMQ не подключается к consumer сам, а присылает сообщения по соединению ④, которое consumer открыл при старте. Соединения ②–⑤ долгоживущие (пулы БД и AMQP) и не создаются заново на каждый платёж.
+- `api` и `consumer` не общаются напрямую: их связывают только PostgreSQL и RabbitMQ.
+- Webhook отправляет контейнер `consumer`, поэтому `localhost` в `webhook_url` указывает на сам consumer, а не на ваш компьютер. Для тестового приёмника используйте `http://webhook-mock:9000/webhook`.
+
 ### Гарантии доставки
 
 | Механизм | Как реализован |
@@ -107,100 +148,3 @@ curl http://localhost:8000/api/v1/payments/<payment_id> \
   "created_at": "2026-10-11T15:21:30.194397Z",
   "processed_at": "2026-10-11T15:21:34.614767Z"
 }
-```
-
-### Webhook
-
-Через 2–5 секунд на `webhook_url` приходит POST:
-
-```json
-{"event": "payment.succeeded", "payment_id": "d4081e63-…", "status": "succeeded",
- "amount": "100.50", "currency": "RUB", "processed_at": "2026-10-11T15:21:34.614767Z"}
-```
-
-Полученные уведомления можно посмотреть так: `curl http://localhost:9000/webhook/received`.
-Чтобы получить уведомления на свой адрес, укажите в `webhook_url` URL с https://webhook.site.
-
-### Проверка retry и DLQ
-
-Укажите `"webhook_url": "http://webhook-mock:9000/webhook/fail"` (всегда отвечает 500).
-В логах consumer (`docker compose logs -f consumer`) будут видны 3 попытки, после чего сообщение окажется в очереди `payments.new.dlq`. Это видно на вкладке *Queues* в панели RabbitMQ или командой:
-
-```bash
-docker compose exec rabbitmq rabbitmqctl list_queues name messages
-```
-
-### Проверка Outbox
-
-```bash
-docker compose stop rabbitmq
-# создайте платёж: API ответит 202, событие останется в outbox
-docker compose exec postgres psql -U payments -c "select id, published_at from outbox"
-docker compose start rabbitmq
-# через несколько секунд событие будет опубликовано и платёж обработан
-```
-
-## Ошибки API
-
-| Код | Когда |
-|---|---|
-| 401 | нет или неверный `X-API-Key` |
-| 404 | платёж не найден |
-| 409 | `Idempotency-Key` уже использован с другим телом запроса |
-| 422 | ошибка валидации или нет заголовка `Idempotency-Key` |
-
-## Структура проекта
-
-```
-app/
-  api/v1/          роутеры (payments) и подключение аутентификации
-  core/            настройки, проверка X-API-Key, логирование
-  db/              async engine и сессии
-  models/          SQLAlchemy-модели payments и outbox
-  schemas/         Pydantic-схемы API и сообщений
-  repositories/    доступ к данным
-  services/        бизнес-логика создания платежа (+ outbox, идемпотентность)
-  broker/          подключение и топология RabbitMQ (exchange'и, очереди, DLX)
-  outbox/relay.py  публикация событий из outbox
-  consumer/        FastStream-приложение: шлюз, обработка, webhook с retry
-  main.py          FastAPI-приложение
-migrations/        Alembic
-webhook_mock/      тестовый приёмник webhook'ов
-tests/             pytest
-```
-
-## Настройки
-
-Все параметры задаются переменными окружения (`app/core/config.py`):
-
-| Переменная | По умолчанию |
-|---|---|
-| `API_KEY` | `super-secret-api-key` |
-| `DATABASE_URL` | `postgresql+asyncpg://payments:payments@localhost:5432/payments` |
-| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` |
-| `OUTBOX_POLL_INTERVAL_SECONDS` | `1.0` |
-| `GATEWAY_MIN_DELAY_SECONDS` / `GATEWAY_MAX_DELAY_SECONDS` | `2` / `5` |
-| `GATEWAY_SUCCESS_RATE` | `0.9` |
-| `WEBHOOK_MAX_ATTEMPTS` | `3` |
-| `WEBHOOK_RETRY_BASE_DELAY_SECONDS` | `1.0` |
-| `WEBHOOK_TIMEOUT_SECONDS` | `5.0` |
-
-## Локальная разработка и тесты
-
-```bash
-python -m venv .venv
-# Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
-pip install -r requirements-dev.txt
-
-pytest          # тесты на SQLite, PostgreSQL и RabbitMQ не нужны
-ruff check .
-```
-
-Запуск без Docker для приложения (PostgreSQL и RabbitMQ при этом нужны, например, `docker compose up postgres rabbitmq`):
-
-```bash
-cp .env.example .env
-alembic upgrade head
-uvicorn app.main:app --reload
-faststream run app.consumer.main:app
-```
